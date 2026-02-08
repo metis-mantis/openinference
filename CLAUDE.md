@@ -2,6 +2,42 @@
 
 This file provides guidance to Claude Code when working with this repository.
 
+## Mantis Fork
+
+This is the **metis-mantis fork** of [Arize-ai/openinference](https://github.com/Arize-ai/openinference). It is included as a git submodule in the `mantis` repo at `mantisdk/openinference`.
+
+### Remotes
+
+- `origin` = `git@github.com:metis-mantis/openinference.git` (our fork -- push here)
+- `upstream` = `https://github.com/Arize-ai/openinference.git` (Arize upstream -- pull updates)
+
+### Mantis-Specific Changes
+
+All Mantis modifications live on the `mantis/insight-trace-io` branch. Current changes:
+
+**`openinference-instrumentation-openai-agents` (`_processor.py`)**:
+- The `OpenInferenceTracingProcessor` now propagates child span input/output to the root "Agent workflow" span using `insight.trace.input` / `insight.trace.output` attributes.
+- This is needed because the OpenAI Agents SDK's `Trace` object doesn't carry input/output data, leaving root spans empty in Mantis Insight.
+- Handles both `ResponseSpanData` (OpenAI Responses API) and `GenerationSpanData` (LiteLLM / chat completions).
+- First child input = user prompt. Last child output = agent's final response (last writer wins).
+
+### Pulling Upstream Updates
+
+```bash
+cd mantisdk/openinference
+git fetch upstream
+git merge upstream/main
+# Resolve any conflicts in _processor.py, then push to origin
+git push origin mantis/insight-trace-io
+```
+
+Then update the submodule pointer in the parent `mantis` repo:
+```bash
+cd ../..
+git add mantisdk/openinference
+git commit -m "chore: update openinference submodule"
+```
+
 ## Repository Overview
 
 OpenInference is a multi-language monorepo providing OpenTelemetry-based instrumentation for AI/ML applications:
