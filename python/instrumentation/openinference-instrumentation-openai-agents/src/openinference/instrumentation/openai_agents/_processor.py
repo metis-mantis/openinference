@@ -78,6 +78,9 @@ class OpenInferenceTracingProcessor(TracingProcessor):
         # Use an OrderedDict and _MAX_HANDOFFS_IN_FLIGHT to cap the size of the dict
         # in case there are large numbers of orphaned handoffs
         self._reverse_handoffs_dict: OrderedDict[str, str] = OrderedDict()
+        # Track which traces already had their first input captured (user prompt).
+        # We only capture once so subsequent conversation turns don't overwrite it.
+        self._trace_first_input_set: set[str] = set()
 
     def on_trace_start(self, trace: Trace) -> None:
         """Called when a trace is started.
@@ -99,6 +102,9 @@ class OpenInferenceTracingProcessor(TracingProcessor):
         Args:
             trace: The trace that started.
         """
+        # Clean up input-tracking state for this trace to prevent memory leaks
+        self._trace_first_input_set.discard(trace.trace_id)
+
         if root_span := self._root_spans.pop(trace.trace_id, None):
             root_span.set_status(Status(StatusCode.OK))
             root_span.end()
@@ -184,6 +190,64 @@ class OpenInferenceTracingProcessor(TracingProcessor):
             key = f"{data.name}:{span.trace_id}"
             if parent_node := self._reverse_handoffs_dict.pop(key, None):
                 otel_span.set_attribute(GRAPH_NODE_PARENT_ID, parent_node)
+
+        # ---- Propagate input/output to root span (Insight semantics) ----
+        # The root span ("Agent workflow") has no input/output by default because
+        # the Trace object from the OpenAI Agents SDK doesn't carry that data.
+        # We bubble up the first child input (user prompt) and last child output
+        # (agent's final response) so Insight displays them on the trace root.
+        #
+        # Handles both span data types:
+        #   - ResponseSpanData: emitted when using the OpenAI Responses API directly
+        #   - GenerationSpanData: emitted when using LiteLLM or chat completions
+        root_span = self._root_spans.get(span.trace_id)
+        if root_span is not None:
+            if isinstance(data, ResponseSpanData):
+                # First input = user prompt -> insight.trace.input
+                if span.trace_id not in self._trace_first_input_set:
+                    if hasattr(data, "input") and data.input:
+                        if isinstance(data.input, str):
+                            root_span.set_attribute(INSIGHT_TRACE_INPUT, data.input)
+                        elif isinstance(data.input, list):
+                            root_span.set_attribute(INSIGHT_TRACE_INPUT, safe_json_dumps(data.input))
+                        self._trace_first_input_set.add(span.trace_id)
+
+                # Last output wins = agent's final response -> insight.trace.output
+                if hasattr(data, "response") and isinstance(data.response, Response):
+                    output_texts: list[str] = []
+                    for item in data.response.output:
+                        if isinstance(item, ResponseOutputMessage):
+                            for c in item.content:
+                                if isinstance(c, ResponseOutputText):
+                                    output_texts.append(c.text)
+                    if output_texts:
+                        root_span.set_attribute(INSIGHT_TRACE_OUTPUT, "\n".join(output_texts))
+
+            elif isinstance(data, GenerationSpanData):
+                # GenerationSpanData uses chat completions format:
+                #   obj.input  -> list of message dicts [{role, content, ...}]
+                #   obj.output -> list of message dicts [{role, content, ...}]
+
+                # First input = user prompt -> insight.trace.input
+                if span.trace_id not in self._trace_first_input_set:
+                    if data.input:
+                        root_span.set_attribute(INSIGHT_TRACE_INPUT, safe_json_dumps(data.input))
+                        self._trace_first_input_set.add(span.trace_id)
+
+                # Last output wins = agent's final response -> insight.trace.output
+                if data.output:
+                    # Extract text content from assistant messages
+                    output_texts = []
+                    for msg in data.output:
+                        if isinstance(msg, Mapping):
+                            content = msg.get("content")
+                            if isinstance(content, str) and content:
+                                output_texts.append(content)
+                    if output_texts:
+                        root_span.set_attribute(INSIGHT_TRACE_OUTPUT, "\n".join(output_texts))
+                    else:
+                        # Fallback: dump the entire output as JSON
+                        root_span.set_attribute(INSIGHT_TRACE_OUTPUT, safe_json_dumps(data.output))
 
         end_time: Optional[int] = None
         if span.ended_at:
@@ -805,3 +869,10 @@ TOOL_CALL_ID = ToolCallAttributes.TOOL_CALL_ID
 TOOL_JSON_SCHEMA = ToolAttributes.TOOL_JSON_SCHEMA
 
 JSON = OpenInferenceMimeTypeValues.JSON.value
+
+# Insight trace-level input/output (highest priority in Insight ingestion).
+# These are checked first by OtelIngestionProcessor.extractInputAndOutput()
+# when domain === "trace", ensuring the root span shows the user prompt and
+# agent final response in the Insight UI.
+INSIGHT_TRACE_INPUT = "insight.trace.input"
+INSIGHT_TRACE_OUTPUT = "insight.trace.output"
