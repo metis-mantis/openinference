@@ -39,6 +39,7 @@ from openai.types.responses import (
 from openai.types.responses.response_input_item_param import FunctionCallOutput, Message
 from openai.types.responses.response_output_message_param import Content
 from opentelemetry.context import attach, detach
+from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import Span as OtelSpan
 from opentelemetry.trace import (
     Status,
@@ -81,6 +82,8 @@ class OpenInferenceTracingProcessor(TracingProcessor):
         # Track which traces already had their first input captured (user prompt).
         # We only capture once so subsequent conversation turns don't overwrite it.
         self._trace_first_input_set: set[str] = set()
+        # Track which traces already had their system prompt captured (first-write-wins).
+        self._trace_system_prompt_set: set[str] = set()
 
     def on_trace_start(self, trace: Trace) -> None:
         """Called when a trace is started.
@@ -102,10 +105,24 @@ class OpenInferenceTracingProcessor(TracingProcessor):
         Args:
             trace: The trace that started.
         """
-        # Clean up input-tracking state for this trace to prevent memory leaks
+        # Clean up tracking state for this trace to prevent memory leaks
         self._trace_first_input_set.discard(trace.trace_id)
+        self._trace_system_prompt_set.discard(trace.trace_id)
 
         if root_span := self._root_spans.pop(trace.trace_id, None):
+            # Debug: verify attributes before ending
+            if isinstance(root_span, ReadableSpan):
+                attrs = dict(root_span.attributes or {})
+                has_input = INSIGHT_TRACE_INPUT in attrs
+                has_output = INSIGHT_TRACE_OUTPUT in attrs
+                has_sp = INSIGHT_TRACE_SYSTEM_PROMPT in attrs
+                logger.info(
+                    "[insight-propagate] on_trace_end: root span attrs before end: "
+                    "has_input=%s, has_output=%s, has_system_prompt=%s, "
+                    "total_attrs=%d, input_preview=%s",
+                    has_input, has_output, has_sp, len(attrs),
+                    str(attrs.get(INSIGHT_TRACE_INPUT, ""))[:80] if has_input else "N/A",
+                )
             root_span.set_status(Status(StatusCode.OK))
             root_span.end()
 
@@ -191,63 +208,124 @@ class OpenInferenceTracingProcessor(TracingProcessor):
             if parent_node := self._reverse_handoffs_dict.pop(key, None):
                 otel_span.set_attribute(GRAPH_NODE_PARENT_ID, parent_node)
 
-        # ---- Propagate input/output to root span (Insight semantics) ----
+        # ---- Propagate input/output/system_prompt to root span (Insight semantics) ----
         # The root span ("Agent workflow") has no input/output by default because
         # the Trace object from the OpenAI Agents SDK doesn't carry that data.
         # We bubble up the first child input (user prompt) and last child output
         # (agent's final response) so Insight displays them on the trace root.
-        #
-        # Handles both span data types:
-        #   - ResponseSpanData: emitted when using the OpenAI Responses API directly
-        #   - GenerationSpanData: emitted when using LiteLLM or chat completions
         root_span = self._root_spans.get(span.trace_id)
         if root_span is not None:
+            logger.debug(
+                "[insight-propagate] span_end: type=%s, trace_id=%s, span_id=%s, "
+                "has_root=%s, input_captured=%s",
+                type(data).__name__,
+                span.trace_id,
+                span.span_id,
+                root_span is not None,
+                span.trace_id in self._trace_first_input_set,
+            )
+
             if isinstance(data, ResponseSpanData):
+                _has_input = hasattr(data, "input") and data.input
+                _has_response = hasattr(data, "response") and isinstance(
+                    getattr(data, "response", None), Response
+                )
+                _has_instructions = hasattr(data, "instructions") and isinstance(
+                    getattr(data, "instructions", None), str
+                ) and data.instructions
+                logger.debug(
+                    "[insight-propagate] ResponseSpanData: has_input=%s, "
+                    "has_response=%s, has_instructions=%s",
+                    _has_input, _has_response, _has_instructions,
+                )
+
                 # First input = user prompt -> insight.trace.input
                 if span.trace_id not in self._trace_first_input_set:
-                    if hasattr(data, "input") and data.input:
+                    if _has_input:
                         if isinstance(data.input, str):
                             root_span.set_attribute(INSIGHT_TRACE_INPUT, data.input)
                         elif isinstance(data.input, list):
                             root_span.set_attribute(INSIGHT_TRACE_INPUT, safe_json_dumps(data.input))
                         self._trace_first_input_set.add(span.trace_id)
+                        logger.debug("[insight-propagate] Set TRACE_INPUT from ResponseSpanData")
 
                 # Last output wins = agent's final response -> insight.trace.output
-                if hasattr(data, "response") and isinstance(data.response, Response):
-                    output_texts: list[str] = []
-                    for item in data.response.output:
-                        if isinstance(item, ResponseOutputMessage):
-                            for c in item.content:
-                                if isinstance(c, ResponseOutputText):
-                                    output_texts.append(c.text)
-                    if output_texts:
-                        root_span.set_attribute(INSIGHT_TRACE_OUTPUT, "\n".join(output_texts))
+                # Store the full structured response as JSON for complete trace visibility
+                if _has_response:
+                    try:
+                        root_span.set_attribute(
+                            INSIGHT_TRACE_OUTPUT,
+                            data.response.model_dump_json(),
+                        )
+                    except Exception:
+                        # Fallback: extract text only
+                        output_texts: list[str] = []
+                        for item in data.response.output:
+                            if isinstance(item, ResponseOutputMessage):
+                                for c in item.content:
+                                    if isinstance(c, ResponseOutputText):
+                                        output_texts.append(c.text)
+                        if output_texts:
+                            root_span.set_attribute(INSIGHT_TRACE_OUTPUT, "\n".join(output_texts))
+                    logger.debug("[insight-propagate] Set TRACE_OUTPUT from ResponseSpanData")
+
+                # System prompt (first agent's instructions win)
+                if span.trace_id not in self._trace_system_prompt_set:
+                    if _has_instructions:
+                        root_span.set_attribute(INSIGHT_TRACE_SYSTEM_PROMPT, data.instructions)
+                        self._trace_system_prompt_set.add(span.trace_id)
+                        logger.debug("[insight-propagate] Set TRACE_SYSTEM_PROMPT from ResponseSpanData")
 
             elif isinstance(data, GenerationSpanData):
-                # GenerationSpanData uses chat completions format:
-                #   obj.input  -> list of message dicts [{role, content, ...}]
-                #   obj.output -> list of message dicts [{role, content, ...}]
+                logger.debug(
+                    "[insight-propagate] GenerationSpanData: has_input=%s, "
+                    "has_output=%s, input_type=%s",
+                    bool(data.input), bool(data.output),
+                    type(data.input).__name__ if data.input else "None",
+                )
 
-                # First input = user prompt -> insight.trace.input
+                # First input = full structured messages -> insight.trace.input
                 if span.trace_id not in self._trace_first_input_set:
                     if data.input:
                         root_span.set_attribute(INSIGHT_TRACE_INPUT, safe_json_dumps(data.input))
                         self._trace_first_input_set.add(span.trace_id)
+                        logger.debug("[insight-propagate] Set TRACE_INPUT from GenerationSpanData")
+
+                    # Also check for system prompt in GenerationSpanData input messages
+                    if span.trace_id not in self._trace_system_prompt_set and data.input:
+                        if isinstance(data.input, list):
+                            for msg in data.input:
+                                if isinstance(msg, Mapping) and msg.get("role") == "system":
+                                    content = msg.get("content")
+                                    if isinstance(content, str) and content:
+                                        root_span.set_attribute(INSIGHT_TRACE_SYSTEM_PROMPT, content)
+                                        self._trace_system_prompt_set.add(span.trace_id)
+                                        logger.debug("[insight-propagate] Set TRACE_SYSTEM_PROMPT from GenerationSpanData")
+                                        break
 
                 # Last output wins = agent's final response -> insight.trace.output
+                # Store the full structured output as JSON for complete trace visibility
                 if data.output:
-                    # Extract text content from assistant messages
-                    output_texts = []
-                    for msg in data.output:
-                        if isinstance(msg, Mapping):
-                            content = msg.get("content")
-                            if isinstance(content, str) and content:
-                                output_texts.append(content)
-                    if output_texts:
-                        root_span.set_attribute(INSIGHT_TRACE_OUTPUT, "\n".join(output_texts))
+                    root_span.set_attribute(INSIGHT_TRACE_OUTPUT, safe_json_dumps(data.output))
+                    logger.debug("[insight-propagate] Set TRACE_OUTPUT from GenerationSpanData")
+
+            else:
+                # Fallback: for any other span data type, try to extract input/output
+                # from the OTel span attributes we just set (INPUT_VALUE / OUTPUT_VALUE)
+                logger.debug(
+                    "[insight-propagate] Unhandled span data type: %s (checking OTel attrs)",
+                    type(data).__name__,
+                )
+                if span.trace_id not in self._trace_first_input_set:
+                    # Check if INPUT_VALUE was set on this child span
+                    if isinstance(otel_span, ReadableSpan):
+                        input_val = otel_span.attributes.get(INPUT_VALUE) if otel_span.attributes else None
                     else:
-                        # Fallback: dump the entire output as JSON
-                        root_span.set_attribute(INSIGHT_TRACE_OUTPUT, safe_json_dumps(data.output))
+                        input_val = None
+                    if input_val and isinstance(input_val, str):
+                        root_span.set_attribute(INSIGHT_TRACE_INPUT, input_val)
+                        self._trace_first_input_set.add(span.trace_id)
+                        logger.debug("[insight-propagate] Set TRACE_INPUT from fallback OTel INPUT_VALUE")
 
         end_time: Optional[int] = None
         if span.ended_at:
@@ -876,3 +954,4 @@ JSON = OpenInferenceMimeTypeValues.JSON.value
 # agent final response in the Insight UI.
 INSIGHT_TRACE_INPUT = "insight.trace.input"
 INSIGHT_TRACE_OUTPUT = "insight.trace.output"
+INSIGHT_TRACE_SYSTEM_PROMPT = "insight.trace.system_prompt"
